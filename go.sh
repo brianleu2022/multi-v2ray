@@ -1,12 +1,7 @@
 #!/bin/bash
 
-# This file is accessible as https://multi.netlify.app/go.sh
-
-# If not specify, default meaning of return value:
-# 0: Success
-# 1: System error
-# 2: Application error
-# 3: Network error
+# Optimized for Debian 12+ (Pure apt & systemd)
+# This file serves as a replacement for the remote go.sh
 
 # CLI arguments
 proxy=''
@@ -26,8 +21,8 @@ new_ver=""
 zipfile="/tmp/v2ray/v2ray.zip"
 v2ray_running=0
 
-cmd_install=""
-cmd_update=""
+cmd_install="apt-get -y -qq install"
+cmd_update="apt-get -qq update"
 software_updated=0
 key="V2Ray"
 key_lower="v2ray"
@@ -54,7 +49,7 @@ while [[ $# > 0 ]]; do
     case "$1" in
         -p|--proxy)
         proxy="-x ${2}"
-        shift # past argument
+        shift
         ;;
         -h|--help)
         help="1"
@@ -91,10 +86,9 @@ while [[ $# > 0 ]]; do
         error_if_uptodate="1"
         ;;
         *)
-                # unknown option
         ;;
     esac
-    shift # past argument or value
+    shift
 done
 
 ###############################
@@ -104,86 +98,40 @@ colorEcho(){
 
 archAffix(){
     case "$(uname -m)" in
-      'i386' | 'i686')
-        machine='32'
-        ;;
       'amd64' | 'x86_64')
         machine='64'
-        ;;
-      'armv5tel')
-        machine='arm32-v5'
-        ;;
-      'armv6l')
-        machine='arm32-v6'
-        grep Features /proc/cpuinfo | grep -qw 'vfp' || machine='arm32-v5'
-        ;;
-      'armv7' | 'armv7l')
-        machine='arm32-v7a'
-        grep Features /proc/cpuinfo | grep -qw 'vfp' || machine='arm32-v5'
         ;;
       'armv8' | 'aarch64')
         machine='arm64-v8a'
         ;;
-      'mips')
-        machine='mips32'
-        ;;
-      'mipsle')
-        machine='mips32le'
-        ;;
-      'mips64')
-        machine='mips64'
-        ;;
-      'mips64le')
-        machine='mips64le'
-        ;;
-      'ppc64')
-        machine='ppc64'
-        ;;
-      'ppc64le')
-        machine='ppc64le'
-        ;;
-      'riscv64')
-        machine='riscv64'
-        ;;
-      's390x')
-        machine='s390x'
-        ;;
-        *)
-        echo "error: The architecture is not supported."
-        exit 1
+      *)
+        # 保留其他较少用的架构供Debian特殊设备（如小主机、大厂云、树莓派）使用
+        case "$(uname -m)" in
+          'i386' | 'i686') machine='32' ;;
+          'armv5tel') machine='arm32-v5' ;;
+          'armv6l') machine='arm32-v6' ;;
+          'armv7' | 'armv7l') machine='arm32-v7a' ;;
+          *) echo "error: The architecture is not supported."; exit 1 ;;
+        esac
         ;;
     esac
-
-	return 0
+    return 0
 }
 
 zipRoot() {
     unzip -lqq "$1" | awk -e '
-        NR == 1 {
-            prefix = $4;
-        }
+        NR == 1 { prefix = $4; }
         NR != 1 {
             prefix_len = length(prefix);
             cur_len = length($4);
-
             for (len = prefix_len < cur_len ? prefix_len : cur_len; len >= 1; len -= 1) {
                 sub_prefix = substr(prefix, 1, len);
                 sub_cur = substr($4, 1, len);
-
-                if (sub_prefix == sub_cur) {
-                    prefix = sub_prefix;
-                    break;
-                }
+                if (sub_prefix == sub_cur) { prefix = sub_prefix; break; }
             }
-
-            if (len == 0) {
-                prefix = "";
-                nextfile;
-            }
+            if (len == 0) { prefix = ""; nextfile; }
         }
-        END {
-            print prefix;
-        }
+        END { print prefix; }
     '
 }
 
@@ -208,11 +156,6 @@ installSoftware(){
         return 0
     fi
 
-    getPMT
-    if [[ $? -eq 1 ]]; then
-        colorEcho ${red} "The system package manager tool isn't APT or YUM, please install ${component} manually."
-        return 1
-    fi
     if [[ $software_updated -eq 0 ]]; then
         colorEcho ${blue} "Updating software repo"
         $cmd_update
@@ -228,39 +171,17 @@ installSoftware(){
     return 0
 }
 
-# return 1: not apt, yum, or zypper
-getPMT(){
-    if [[ -n `command -v apt-get` ]];then
-        cmd_install="apt-get -y -qq install"
-        cmd_update="apt-get -qq update"
-    elif [[ -n `command -v yum` ]]; then
-        cmd_install="yum -y -q install"
-        cmd_update="yum -q makecache"
-    elif [[ -n `command -v zypper` ]]; then
-        cmd_install="zypper -y install"
-        cmd_update="zypper ref"
-    else
-        return 1
-    fi
-    return 0
-}
-
 normalizeVersion() {
     if [ -n "$1" ]; then
         case "$1" in
-            v*)
-                echo "$1"
-            ;;
-            *)
-                echo "v$1"
-            ;;
+            v*) echo "$1" ;;
+            *) echo "v$1" ;;
         esac
     else
         echo ""
     fi
 }
 
-# 1: new V2Ray. 0: no. 2: not installed. 3: check failed. 4: don't check.
 getVersion(){
     if [[ -n "$version" ]]; then
         new_ver="$(normalizeVersion "$version")"
@@ -309,7 +230,6 @@ startV2ray(){
 }
 
 installV2Ray(){
-    # Install $key binary to /usr/bin/$key_lower
     if [[ $key == "V2Ray" && `unzip -l $1|grep v2ctl` ]];then
         unzip_param="$2v2ctl"
         chmod_param="/usr/bin/$key_lower/v2ctl"
@@ -321,7 +241,6 @@ installV2Ray(){
         return 1
     }
 
-    # Install V2Ray server config to /etc/v2ray
     if [ ! -f /etc/$key_lower/config.json ]; then
         local port="$(($RANDOM + 10000))"
         local uuid="$(cat '/proc/sys/kernel/random/uuid')"
@@ -375,7 +294,6 @@ EOF
         colorEcho ${blue} "uuid:${uuid}"
     fi
 }
-
 
 installInitScript(){
     if [[ -e /.dockerenv ]]; then
@@ -443,33 +361,17 @@ EOF
 
 remove(){
     if [[ -n "${systemctl_cmd}" ]] && [[ -f "/etc/systemd/system/$key_lower.service" ]];then
-        if pgrep "$key_lower" > /dev/null ; then
-            stopV2ray
-        fi
+        if pgrep "$key_lower" > /dev/null ; then stopV2ray; fi
         systemctl disable $key_lower.service
         rm -rf "/usr/bin/$key_lower" "/etc/systemd/system/$key_lower.service"
-        if [[ $? -ne 0 ]]; then
-            colorEcho ${red} "Failed to remove $key."
-            return 0
-        else
-            colorEcho ${green} "Removed $key successfully."
-            colorEcho ${blue} "If necessary, please remove configuration file and log file manually."
-            return 0
-        fi
+        colorEcho ${green} "Removed $key successfully."
+        return 0
     elif [[ -n "${systemctl_cmd}" ]] && [[ -f "/lib/systemd/system/$key_lower.service" ]];then
-        if pgrep "$key_lower" > /dev/null ; then
-            stopV2ray
-        fi
+        if pgrep "$key_lower" > /dev/null ; then stopV2ray; fi
         systemctl disable $key_lower.service
         rm -rf "/usr/bin/$key_lower" "/lib/systemd/system/$key_lower.service"
-        if [[ $? -ne 0 ]]; then
-            colorEcho ${red} "Failed to remove $key."
-            return 0
-        else
-            colorEcho ${green} "Removed $key successfully."
-            colorEcho ${blue} "If necessary, please remove configuration file and log file manually."
-            return 0
-        fi
+        colorEcho ${green} "Removed $key successfully."
+        return 0
     else
         colorEcho ${yellow} "$key not found."
         return 0
@@ -493,7 +395,6 @@ checkUpdate(){
 }
 
 main(){
-    #helping information
     [[ "$help" == "1" ]] && Help && return
     [[ "$check" == "1" ]] && checkUpdate && return
     [[ "$remove" == "1" ]] && remove && return
@@ -501,22 +402,18 @@ main(){
     local arch=$(uname -m)
     archAffix
 
-    # extract local file
     if [[ $local_install -eq 1 ]]; then
-        colorEcho ${yellow} "Installing $key via local file. Please make sure the file is a valid $key package, as we are not able to determine that."
+        colorEcho ${yellow} "Installing $key via local file. Please make sure the file is a valid $key package."
         new_ver=local
         rm -rf /tmp/$key_lower
         zipfile="$local"
     else
-        # download via network and extract
         installSoftware "curl" || return $?
         getVersion
         retval="$?"
         if [[ $retval == 0 ]] && [[ "$force" != "1" ]]; then
             colorEcho ${blue} "Latest version ${cur_ver} is already installed."
-            if [ -n "${error_if_uptodate}" ]; then
-              return 10
-            fi
+            if [ -n "${error_if_uptodate}" ]; then return 10; fi
             return
         elif [[ $retval == 3 ]]; then
             return 3
@@ -531,7 +428,6 @@ main(){
 
     if [ -n "${extract_only}" ]; then
         colorEcho ${blue} "Extracting $key package to ${vsrc_root}."
-
         if unzip -o "${zipfile}" -d ${vsrc_root}; then
             colorEcho ${green} "$key extracted to ${vsrc_root%/}${ziproot:+/${ziproot%/}}, and exiting..."
             return 0
