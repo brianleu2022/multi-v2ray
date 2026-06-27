@@ -1,7 +1,6 @@
 #!/bin/bash
 # Author: Jrohy
 # github: https://github.com/Jrohy/multi-v2ray
-# Optimized for Debian 12+ (Pure nftables & apt)
 
 # 记录最开始运行脚本的路径
 begin_path="$(pwd)"
@@ -20,6 +19,9 @@ util_path="/etc/v2ray_util/util.cfg"
 util_cfg="$base_source_path/v2ray_util/util_core/util.cfg"
 bash_completion_shell="$base_source_path/v2ray"
 clean_iptables_shell="$base_source_path/v2ray_util/global_setting/clean_iptables.sh"
+
+# Centos 临时取消别名
+[[ -f /etc/redhat-release && -z "$(echo "$SHELL" | grep zsh)" ]] && unalias -a
 
 [[ -z "$(echo "$SHELL" | grep zsh)" ]] && env_file=".bashrc" || env_file=".zshrc"
 
@@ -108,23 +110,20 @@ help() {
 }
 
 removeV2Ray() {
-    local pip_cmd
+    local pip_cmd rc_service rc_file
 
     # 卸载V2ray脚本
-    bash <(curl -L -s https://raw.githubusercontent.com/brianleu2022/multi-v2ray/refs/heads/master/go.sh) --remove >/dev/null 2>&1
+    bash <(curl -L -s https://multi.netlify.app/go.sh) --remove >/dev/null 2>&1
     rm -rf /etc/v2ray >/dev/null 2>&1
     rm -rf /var/log/v2ray >/dev/null 2>&1
 
     # 卸载Xray脚本
-    bash <(curl -L -s https://raw.githubusercontent.com/brianleu2022/multi-v2ray/refs/heads/master/go.sh) --remove -x >/dev/null 2>&1
+    bash <(curl -L -s https://multi.netlify.app/go.sh) --remove -x >/dev/null 2>&1
     rm -rf /etc/xray >/dev/null 2>&1
     rm -rf /var/log/xray >/dev/null 2>&1
 
-    # 清理v2ray相关规则
+    # 清理v2ray相关iptable规则
     bash <(curl -L -s "$clean_iptables_shell")
-    if command -v nft >/dev/null 2>&1; then
-        nft flush ruleset 2>/dev/null
-    fi
 
     # 卸载multi-v2ray
     pip_cmd="$(get_pip_cmd 2>/dev/null)"
@@ -143,63 +142,109 @@ removeV2Ray() {
     rm -rf /etc/v2ray_util >/dev/null 2>&1
     rm -rf /etc/profile.d/iptables.sh >/dev/null 2>&1
     rm -rf /root/.iptables >/dev/null 2>&1
-    rm -rf /root/.nftables.conf >/dev/null 2>&1
 
     # 删除v2ray定时更新任务
     crontab -l 2>/dev/null | sed '/SHELL=/d;/v2ray/d;/xray/d' > crontab.txt
     crontab crontab.txt >/dev/null 2>&1
     rm -f crontab.txt >/dev/null 2>&1
 
-    systemctl restart cron >/dev/null 2>&1
+    if [[ ${package_manager} == 'dnf' || ${package_manager} == 'yum' ]]; then
+        systemctl restart crond >/dev/null 2>&1
+    else
+        systemctl restart cron >/dev/null 2>&1
+    fi
 
     # 删除multi-v2ray环境变量
     sed -i '/v2ray/d' ~/"$env_file" 2>/dev/null
     sed -i '/xray/d' ~/"$env_file" 2>/dev/null
     source ~/"$env_file" >/dev/null 2>&1
 
+    rc_service="$(systemctl status rc-local 2>/dev/null | grep loaded | egrep -o "[A-Za-z/._-]+/rc-local.service" | head -n1)"
+    if [[ -n "$rc_service" && -f "$rc_service" ]]; then
+        rc_file="$(grep ExecStart "$rc_service" | awk '{print $1}' | cut -d = -f2)"
+        [[ -n "$rc_file" && -f "$rc_file" ]] && sed -i '/iptables/d' "$rc_file"
+    fi
+
     colorEcho "${green}" "uninstall success!"
+}
+
+closeSELinux() {
+    # 禁用SELinux
+    if [[ -s /etc/selinux/config ]] && grep -q 'SELINUX=enforcing' /etc/selinux/config; then
+        sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
+        setenforce 0 >/dev/null 2>&1
+    fi
 }
 
 checkSys() {
     # 检查是否为Root
     [[ "$(id -u)" != "0" ]] && { colorEcho "${red}" "Error: You must be root to run this script"; exit 1; }
 
-    # 锁定仅支持 apt 架构的 Debian 12+ 系统
-    if ! command -v apt-get >/dev/null 2>&1; then
-        colorEcho "${red}" "Not support OS! This script is optimized for Debian/Ubuntu systems."
+    if command -v apt-get >/dev/null 2>&1; then
+        package_manager='apt-get'
+    elif command -v dnf >/dev/null 2>&1; then
+        package_manager='dnf'
+    elif command -v yum >/dev/null 2>&1; then
+        package_manager='yum'
+    else
+        colorEcho "${red}" "Not support OS!"
         exit 1
     fi
 }
 
 # 安装依赖
 installDependent() {
-    apt-get update -y
-    apt-get install socat cron bash-completion ntpdate gawk curl ca-certificates nftables -y
+    if [[ ${package_manager} == 'dnf' || ${package_manager} == 'yum' ]]; then
+        ${package_manager} install socat crontabs bash-completion which -y
+    else
+        ${package_manager} update -y
+        ${package_manager} install socat cron bash-completion ntpdate gawk curl ca-certificates -y
+    fi
 
     # install python3 & pip
     source <(curl -sL https://python3.netlify.app/install.sh)
 }
 
 updateProject() {
-    local pip_cmd pip_install_ok=0 v2ray_util_bin
+    local pip_cmd rc_service rc_file local_ip iptable_way v2ray_util_bin pip_install_ok=0
 
     pip_cmd="$(get_pip_cmd)"
     [[ -z "$pip_cmd" ]] && colorEcho "${red}" "pip no install!" && exit 1
 
     [[ -e /etc/profile.d/iptables.sh ]] && rm -f /etc/profile.d/iptables.sh
 
-    # --- nftables 规则持久化配置 (Debian 12+) ---
-    if command -v nft >/dev/null 2>&1; then
-        systemctl enable nftables >/dev/null 2>&1
-        nft list ruleset > /root/.nftables.conf 2>/dev/null
-        if [[ -f /etc/nftables.conf ]]; then
-            if ! grep -q "/root/.nftables.conf" /etc/nftables.conf; then
-                echo 'include "/root/.nftables.conf"' >> /etc/nftables.conf
+    rc_service="$(systemctl status rc-local 2>/dev/null | grep loaded | egrep -o "[A-Za-z/._-]+/rc-local.service" | head -n1)"
+    rc_file=""
+    [[ -n "$rc_service" && -f "$rc_service" ]] && rc_file="$(grep ExecStart "$rc_service" | awk '{print $1}' | cut -d = -f2)"
+
+    if [[ -n "$rc_file" ]]; then
+        if [[ ! -e "$rc_file" || -z "$(grep iptables "$rc_file" 2>/dev/null)" ]]; then
+            local_ip="$(curl -s http://api.ipify.org 2>/dev/null)"
+            [[ "$(echo "$local_ip" | grep :)" ]] && iptable_way="ip6tables" || iptable_way="iptables"
+
+            if [[ ! -e "$rc_file" || -z "$(grep "/bin/bash" "$rc_file" 2>/dev/null)" ]]; then
+                echo "#!/bin/bash" >> "$rc_file"
             fi
+
+            if [[ -z "$(grep "\[Install\]" "$rc_service" 2>/dev/null)" ]]; then
+                cat >> "$rc_service" << EOF
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                systemctl daemon-reload
+            fi
+
+            echo "[[ -e /root/.iptables ]] && ${iptable_way}-restore -c < /root/.iptables" >> "$rc_file"
+            chmod +x "$rc_file"
+            systemctl restart rc-local >/dev/null 2>&1
+            systemctl enable rc-local >/dev/null 2>&1
+
+            ${iptable_way}-save -c > /root/.iptables 2>/dev/null
         fi
     fi
 
-    # Debian 12+ 强行兼容 PEP 668 规则限制
+    # Debian 12 兼容：优先尝试正常安装，失败再尝试 break-system-packages
     $pip_cmd install -U v2ray_util >/dev/null 2>&1 && pip_install_ok=1
 
     if [[ $pip_install_ok -ne 1 ]]; then
@@ -248,7 +293,7 @@ updateProject() {
     fi
 
     # 安装V2ray主程序
-    [[ ${install_way} == 0 ]] && bash <(curl -L -s https://raw.githubusercontent.com/brianleu2022/multi-v2ray/refs/heads/master/go.sh)
+    [[ ${install_way} == 0 ]] && bash <(curl -L -s https://multi.netlify.app/go.sh)
 }
 
 # 时间同步
@@ -304,6 +349,7 @@ main() {
 
     checkSys
     installDependent
+    closeSELinux
     timeSync
     updateProject
     profileInit
