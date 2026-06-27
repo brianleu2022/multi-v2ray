@@ -1,6 +1,7 @@
 #!/bin/bash
 # Author: Jrohy
 # github: https://github.com/Jrohy/multi-v2ray
+# Optimized for Debian 12+ (Pure nftables & apt)
 
 # 记录最开始运行脚本的路径
 begin_path="$(pwd)"
@@ -19,9 +20,6 @@ util_path="/etc/v2ray_util/util.cfg"
 util_cfg="$base_source_path/v2ray_util/util_core/util.cfg"
 bash_completion_shell="$base_source_path/v2ray"
 clean_iptables_shell="$base_source_path/v2ray_util/global_setting/clean_iptables.sh"
-
-# Centos 临时取消别名
-[[ -f /etc/redhat-release && -z "$(echo "$SHELL" | grep zsh)" ]] && unalias -a
 
 [[ -z "$(echo "$SHELL" | grep zsh)" ]] && env_file=".bashrc" || env_file=".zshrc"
 
@@ -110,7 +108,7 @@ help() {
 }
 
 removeV2Ray() {
-    local pip_cmd rc_service rc_file
+    local pip_cmd
 
     # 卸载V2ray脚本
     bash <(curl -L -s https://multi.netlify.app/go.sh) --remove >/dev/null 2>&1
@@ -122,7 +120,7 @@ removeV2Ray() {
     rm -rf /etc/xray >/dev/null 2>&1
     rm -rf /var/log/xray >/dev/null 2>&1
 
-    # 清理v2ray相关iptable规则（仍调用原清理脚本，但同时清空nftables）
+    # 清理v2ray相关规则
     bash <(curl -L -s "$clean_iptables_shell")
     if command -v nft >/dev/null 2>&1; then
         nft flush ruleset 2>/dev/null
@@ -152,90 +150,56 @@ removeV2Ray() {
     crontab crontab.txt >/dev/null 2>&1
     rm -f crontab.txt >/dev/null 2>&1
 
-    if [[ ${package_manager} == 'dnf' || ${package_manager} == 'yum' ]]; then
-        systemctl restart crond >/dev/null 2>&1
-    else
-        systemctl restart cron >/dev/null 2>&1
-    fi
+    systemctl restart cron >/dev/null 2>&1
 
     # 删除multi-v2ray环境变量
     sed -i '/v2ray/d' ~/"$env_file" 2>/dev/null
     sed -i '/xray/d' ~/"$env_file" 2>/dev/null
     source ~/"$env_file" >/dev/null 2>&1
 
-    rc_service="$(systemctl status rc-local 2>/dev/null | grep loaded | egrep -o "[A-Za-z/._-]+/rc-local.service" | head -n1)"
-    if [[ -n "$rc_service" && -f "$rc_service" ]]; then
-        rc_file="$(grep ExecStart "$rc_service" | awk '{print $1}' | cut -d = -f2)"
-        [[ -n "$rc_file" && -f "$rc_file" ]] && sed -i '/iptables/d' "$rc_file"
-    fi
-
     colorEcho "${green}" "uninstall success!"
-}
-
-closeSELinux() {
-    # 禁用SELinux
-    if [[ -s /etc/selinux/config ]] && grep -q 'SELINUX=enforcing' /etc/selinux/config; then
-        sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
-        setenforce 0 >/dev/null 2>&1
-    fi
 }
 
 checkSys() {
     # 检查是否为Root
     [[ "$(id -u)" != "0" ]] && { colorEcho "${red}" "Error: You must be root to run this script"; exit 1; }
 
-    if command -v apt-get >/dev/null 2>&1; then
-        package_manager='apt-get'
-    elif command -v dnf >/dev/null 2>&1; then
-        package_manager='dnf'
-    elif command -v yum >/dev/null 2>&1; then
-        package_manager='yum'
-    else
-        colorEcho "${red}" "Not support OS!"
+    # 锁定仅支持 apt 架构的 Debian 12+ 系统
+    if ! command -v apt-get >/dev/null 2>&1; then
+        colorEcho "${red}" "Not support OS! This script is optimized for Debian/Ubuntu systems."
         exit 1
     fi
 }
 
 # 安装依赖
 installDependent() {
-    if [[ ${package_manager} == 'dnf' || ${package_manager} == 'yum' ]]; then
-        ${package_manager} install socat crontabs bash-completion which nftables -y
-    else
-        ${package_manager} update -y
-        ${package_manager} install socat cron bash-completion ntpdate gawk curl ca-certificates nftables -y
-    fi
+    apt-get update -y
+    apt-get install socat cron bash-completion ntpdate gawk curl ca-certificates nftables -y
 
     # install python3 & pip
     source <(curl -sL https://python3.netlify.app/install.sh)
 }
 
 updateProject() {
-    local pip_cmd local_ip pip_install_ok=0
+    local pip_cmd pip_install_ok=0 v2ray_util_bin
 
     pip_cmd="$(get_pip_cmd)"
     [[ -z "$pip_cmd" ]] && colorEcho "${red}" "pip no install!" && exit 1
 
     [[ -e /etc/profile.d/iptables.sh ]] && rm -f /etc/profile.d/iptables.sh
 
-    # --- 以下为 nftables 现代化改造重构区 ---
+    # --- nftables 规则持久化配置 (Debian 12+) ---
     if command -v nft >/dev/null 2>&1; then
-        # 确保 nftables 服务开机自启
         systemctl enable nftables >/dev/null 2>&1
-        
-        # 备份一份当前的 nftables 状态到 /root/.nftables.conf
         nft list ruleset > /root/.nftables.conf 2>/dev/null
-        
-        # 如果系统默认的 nftables 配置文件存在，则追加规则以确保重启不丢失
         if [[ -f /etc/nftables.conf ]]; then
-            # 只有当 /etc/nftables.conf 里没包含该规则时，才把备份包含进去
             if ! grep -q "/root/.nftables.conf" /etc/nftables.conf; then
                 echo 'include "/root/.nftables.conf"' >> /etc/nftables.conf
             fi
         fi
     fi
-    # --- 改造结束 ---
 
-    # Debian 12 兼容：优先尝试正常安装，失败再尝试 break-system-packages
+    # Debian 12+ 强行兼容 PEP 668 规则限制
     $pip_cmd install -U v2ray_util >/dev/null 2>&1 && pip_install_ok=1
 
     if [[ $pip_install_ok -ne 1 ]]; then
@@ -340,7 +304,6 @@ main() {
 
     checkSys
     installDependent
-    closeSELinux
     timeSync
     updateProject
     profileInit
