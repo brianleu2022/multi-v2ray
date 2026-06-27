@@ -122,8 +122,11 @@ removeV2Ray() {
     rm -rf /etc/xray >/dev/null 2>&1
     rm -rf /var/log/xray >/dev/null 2>&1
 
-    # 清理v2ray相关iptable规则
+    # 清理v2ray相关iptable规则（仍调用原清理脚本，但同时清空nftables）
     bash <(curl -L -s "$clean_iptables_shell")
+    if command -v nft >/dev/null 2>&1; then
+        nft flush ruleset 2>/dev/null
+    fi
 
     # 卸载multi-v2ray
     pip_cmd="$(get_pip_cmd 2>/dev/null)"
@@ -142,6 +145,7 @@ removeV2Ray() {
     rm -rf /etc/v2ray_util >/dev/null 2>&1
     rm -rf /etc/profile.d/iptables.sh >/dev/null 2>&1
     rm -rf /root/.iptables >/dev/null 2>&1
+    rm -rf /root/.nftables.conf >/dev/null 2>&1
 
     # 删除v2ray定时更新任务
     crontab -l 2>/dev/null | sed '/SHELL=/d;/v2ray/d;/xray/d' > crontab.txt
@@ -195,10 +199,10 @@ checkSys() {
 # 安装依赖
 installDependent() {
     if [[ ${package_manager} == 'dnf' || ${package_manager} == 'yum' ]]; then
-        ${package_manager} install socat crontabs bash-completion which -y
+        ${package_manager} install socat crontabs bash-completion which nftables -y
     else
         ${package_manager} update -y
-        ${package_manager} install socat cron bash-completion ntpdate gawk curl ca-certificates -y
+        ${package_manager} install socat cron bash-completion ntpdate gawk curl ca-certificates nftables -y
     fi
 
     # install python3 & pip
@@ -206,43 +210,30 @@ installDependent() {
 }
 
 updateProject() {
-    local pip_cmd rc_service rc_file local_ip iptable_way v2ray_util_bin pip_install_ok=0
+    local pip_cmd local_ip pip_install_ok=0
 
     pip_cmd="$(get_pip_cmd)"
     [[ -z "$pip_cmd" ]] && colorEcho "${red}" "pip no install!" && exit 1
 
     [[ -e /etc/profile.d/iptables.sh ]] && rm -f /etc/profile.d/iptables.sh
 
-    rc_service="$(systemctl status rc-local 2>/dev/null | grep loaded | egrep -o "[A-Za-z/._-]+/rc-local.service" | head -n1)"
-    rc_file=""
-    [[ -n "$rc_service" && -f "$rc_service" ]] && rc_file="$(grep ExecStart "$rc_service" | awk '{print $1}' | cut -d = -f2)"
-
-    if [[ -n "$rc_file" ]]; then
-        if [[ ! -e "$rc_file" || -z "$(grep iptables "$rc_file" 2>/dev/null)" ]]; then
-            local_ip="$(curl -s http://api.ipify.org 2>/dev/null)"
-            [[ "$(echo "$local_ip" | grep :)" ]] && iptable_way="ip6tables" || iptable_way="iptables"
-
-            if [[ ! -e "$rc_file" || -z "$(grep "/bin/bash" "$rc_file" 2>/dev/null)" ]]; then
-                echo "#!/bin/bash" >> "$rc_file"
+    # --- 以下为 nftables 现代化改造重构区 ---
+    if command -v nft >/dev/null 2>&1; then
+        # 确保 nftables 服务开机自启
+        systemctl enable nftables >/dev/null 2>&1
+        
+        # 备份一份当前的 nftables 状态到 /root/.nftables.conf
+        nft list ruleset > /root/.nftables.conf 2>/dev/null
+        
+        # 如果系统默认的 nftables 配置文件存在，则追加规则以确保重启不丢失
+        if [[ -f /etc/nftables.conf ]]; then
+            # 只有当 /etc/nftables.conf 里没包含该规则时，才把备份包含进去
+            if ! grep -q "/root/.nftables.conf" /etc/nftables.conf; then
+                echo 'include "/root/.nftables.conf"' >> /etc/nftables.conf
             fi
-
-            if [[ -z "$(grep "\[Install\]" "$rc_service" 2>/dev/null)" ]]; then
-                cat >> "$rc_service" << EOF
-
-[Install]
-WantedBy=multi-user.target
-EOF
-                systemctl daemon-reload
-            fi
-
-            echo "[[ -e /root/.iptables ]] && ${iptable_way}-restore -c < /root/.iptables" >> "$rc_file"
-            chmod +x "$rc_file"
-            systemctl restart rc-local >/dev/null 2>&1
-            systemctl enable rc-local >/dev/null 2>&1
-
-            ${iptable_way}-save -c > /root/.iptables 2>/dev/null
         fi
     fi
+    # --- 改造结束 ---
 
     # Debian 12 兼容：优先尝试正常安装，失败再尝试 break-system-packages
     $pip_cmd install -U v2ray_util >/dev/null 2>&1 && pip_install_ok=1
